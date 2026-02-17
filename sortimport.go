@@ -31,7 +31,7 @@ var (
 	write            = flag.Bool("w", false, "write result to (source) file instead of stdout")
 	localPrefix      = flag.String("local", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
 	secondPrefix     = flag.String("second", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
-	updateCache      = flag.Bool("update-cache", false, "update the standard package cache for current Go version")
+	updateCache      = flag.Bool("u", false, "update the standard package cache for current Go version")
 	verbose          bool // verbose logging
 	standardPackages = make(map[string]struct{})
 	cacheManager     *CacheManager
