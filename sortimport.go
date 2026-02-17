@@ -31,8 +31,10 @@ var (
 	write            = flag.Bool("w", false, "write result to (source) file instead of stdout")
 	localPrefix      = flag.String("local", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
 	secondPrefix     = flag.String("second", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
+	updateCache      = flag.Bool("update-cache", false, "update the standard package cache for current Go version")
 	verbose          bool // verbose logging
 	standardPackages = make(map[string]struct{})
+	cacheManager     *CacheManager
 )
 
 // impModel is used for storing import information
@@ -121,6 +123,25 @@ func goImportsSortMain() error {
 		log.SetOutput(io.Discard)
 	}
 
+	// Initialize cache manager
+	var err error
+	cacheManager, err = newCacheManager()
+	if err != nil {
+		log.Printf("warning: failed to initialize cache manager: %v\n", err)
+	}
+
+	// Handle cache update flag
+	if *updateCache {
+		if cacheManager == nil {
+			return errors.New("cache manager not available")
+		}
+		if err := cacheManager.update(); err != nil {
+			return fmt.Errorf("failed to update cache: %w", err)
+		}
+		fmt.Printf("Cache updated for %s\n", cacheManager.version)
+		return nil
+	}
+
 	if *localPrefix == "" {
 		log.Println("no prefix found, using module name")
 
@@ -137,7 +158,7 @@ func goImportsSortMain() error {
 	}
 
 	// load it in global
-	err := loadStandardPackages()
+	err = loadStandardPackages()
 	if err != nil {
 		panic(err)
 	}
@@ -405,27 +426,49 @@ type PackageInfo struct {
 	Version string              `json:"version"`
 }
 
-func getCachePath() (string, error) {
-	homedir, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	path := filepath.Join(homedir, ".cache/sortimport.json")
-	return path, nil
+// CacheManager handles version-aware cache operations
+type CacheManager struct {
+	cacheDir string
+	version  string
 }
 
-// readCache load the file under user home which stores standard package info
-func readCache() (*PackageInfo, error) {
-	path, err := getCachePath()
+// newCacheManager creates a new CacheManager for the current Go version
+func newCacheManager() (*CacheManager, error) {
+	homedir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
+	cacheDir := filepath.Join(homedir, ".cache", "sortimport")
+	version := runtime.Version()
 
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	return &CacheManager{
+		cacheDir: cacheDir,
+		version:  version,
+	}, nil
+}
+
+// getCacheFile returns the version-specific cache file path
+func (c *CacheManager) getCacheFile() string {
+	// Sanitize version for filename (replace spaces and special chars)
+	safeVersion := strings.ReplaceAll(c.version, " ", "_")
+	return filepath.Join(c.cacheDir, safeVersion+".json")
+}
+
+// getOldCachePath returns the old single-file cache path for migration
+func (c *CacheManager) getOldCachePath() string {
+	homedir, _ := os.UserHomeDir()
+	return filepath.Join(homedir, ".cache", "sortimport.json")
+}
+
+// read loads the cache for the current Go version
+func (c *CacheManager) read() (*PackageInfo, error) {
+	cacheFile := c.getCacheFile()
+
+	if _, err := os.Stat(cacheFile); os.IsNotExist(err) {
 		return nil, err
 	}
 
-	bs, err := os.ReadFile(path)
+	bs, err := os.ReadFile(cacheFile)
 	if err != nil {
 		return nil, err
 	}
@@ -435,65 +478,113 @@ func readCache() (*PackageInfo, error) {
 		return nil, err
 	}
 
-	fmt.Printf("load standard package cache from %s\n", path)
-
+	fmt.Printf("load standard package cache from %s\n", cacheFile)
 	return &info, nil
 }
 
-// writeCache write standard package info with current runtime version into use home cache file (in json)
-func writeCache(version string, standardPackages map[string]struct{}) error {
-	path, err := getCachePath()
-	if err != nil {
+// write saves the cache for the current Go version
+func (c *CacheManager) write(packages map[string]struct{}) error {
+	// Ensure cache directory exists
+	if err := os.MkdirAll(c.cacheDir, 0755); err != nil {
 		return err
 	}
 
-	var info PackageInfo
-	info.Data = make(map[string]struct{})
-	for k, v := range standardPackages {
+	cacheFile := c.getCacheFile()
+	info := PackageInfo{
+		Data:    make(map[string]struct{}),
+		Version: c.version,
+	}
+	for k, v := range packages {
 		info.Data[k] = v
 	}
-	info.Version = version
 
 	bs, err := json.Marshal(info)
 	if err != nil {
 		return err
 	}
 
-	err = os.WriteFile(path, bs, 0644)
+	if err := os.WriteFile(cacheFile, bs, 0644); err != nil {
+		return err
+	}
+
+	fmt.Printf("write standard package cache to %s\n", cacheFile)
+	return nil
+}
+
+// update forces a cache refresh for the current Go version
+func (c *CacheManager) update() error {
+	pkgs, err := packages.Load(nil, "std")
 	if err != nil {
 		return err
 	}
-	fmt.Printf("write standard package cache to %s\n", path)
-	return nil
 
+	packages := make(map[string]struct{})
+	for _, p := range pkgs {
+		packages[p.PkgPath] = struct{}{}
+	}
+
+	return c.write(packages)
+}
+
+// loadOrFetch loads from cache if available, otherwise fetches and caches
+func (c *CacheManager) loadOrFetch() (map[string]struct{}, error) {
+	// Try to read from cache first
+	info, err := c.read()
+	if err == nil && info != nil {
+		return info.Data, nil
+	}
+
+	// Cache miss or error - fetch fresh data
+	pkgs, err := packages.Load(nil, "std")
+	if err != nil {
+		return nil, err
+	}
+
+	packages := make(map[string]struct{})
+	for _, p := range pkgs {
+		packages[p.PkgPath] = struct{}{}
+	}
+
+	// Write to cache
+	if err := c.write(packages); err != nil {
+		log.Printf("warning: failed to write cache: %v", err)
+	}
+
+	return packages, nil
 }
 
 // loadStandardPackages tries to fetch all golang std packages
 func loadStandardPackages() error {
-	info, _ := readCache()
-	if info != nil {
-		// only use cache while version is matched
-		version := runtime.Version()
-		if version == info.Version {
-			for k, v := range info.Data {
-				standardPackages[k] = v
-			}
-			return nil
+	// Initialize cacheManager if not already done
+	if cacheManager == nil {
+		var err error
+		cacheManager, err = newCacheManager()
+		if err != nil {
+			log.Printf("warning: failed to initialize cache manager: %v\n", err)
 		}
 	}
 
+	// Use CacheManager if available
+	if cacheManager != nil {
+		pkgs, err := cacheManager.loadOrFetch()
+		if err != nil {
+			return err
+		}
+		for k, v := range pkgs {
+			standardPackages[k] = v
+		}
+		return nil
+	}
+
+	// Fallback: load directly without cache
 	pkgs, err := packages.Load(nil, "std")
-	if err == nil {
-		for _, p := range pkgs {
-			standardPackages[p.PkgPath] = struct{}{}
-		}
-
-		// for each time we do the parse, cache it
-		version := runtime.Version()
-		writeCache(version, standardPackages)
+	if err != nil {
+		return err
 	}
-
-	return err
+	for _, p := range pkgs {
+		standardPackages[p.PkgPath] = struct{}{}
+	}
+	return nil
 }
 
 // isStandardPackage checks if a package string is included in the standardPackages map

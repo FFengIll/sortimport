@@ -2,11 +2,20 @@ package main
 
 import (
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
+
+func TestMain(m *testing.M) {
+	// Load standard packages before running tests
+	if err := loadStandardPackages(); err != nil {
+		panic("failed to load standard packages: " + err.Error())
+	}
+	os.Exit(m.Run())
+}
 
 func TestProcessFile(t *testing.T) {
 	asserts := assert.New(t)
@@ -216,4 +225,126 @@ func Test_loadStandardPackages(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCacheManager_New(t *testing.T) {
+	cm, err := newCacheManager()
+	assert.NoError(t, err)
+	assert.NotNil(t, cm)
+	assert.NotEmpty(t, cm.version)
+	assert.Contains(t, cm.cacheDir, ".cache/sortimport")
+}
+
+func TestCacheManager_GetCacheFile(t *testing.T) {
+	cm, err := newCacheManager()
+	assert.NoError(t, err)
+
+	cacheFile := cm.getCacheFile()
+	assert.Contains(t, cacheFile, ".cache/sortimport")
+	assert.Contains(t, cacheFile, cm.version)
+	assert.True(t, strings.HasSuffix(cacheFile, ".json"))
+}
+
+func TestCacheManager_WriteAndRead(t *testing.T) {
+	// Create a temp directory for testing
+	tmpDir := t.TempDir()
+	cm := &CacheManager{
+		cacheDir: tmpDir,
+		version:  "go1.21.0",
+	}
+
+	// Test data
+	testPackages := map[string]struct{}{
+		"fmt":   {},
+		"os":    {},
+		"strings": {},
+	}
+
+	// Write cache
+	err := cm.write(testPackages)
+	assert.NoError(t, err)
+
+	// Verify file exists
+	cacheFile := cm.getCacheFile()
+	_, err = os.Stat(cacheFile)
+	assert.NoError(t, err)
+
+	// Read cache
+	info, err := cm.read()
+	assert.NoError(t, err)
+	assert.NotNil(t, info)
+	assert.Equal(t, "go1.21.0", info.Version)
+	assert.Contains(t, info.Data, "fmt")
+	assert.Contains(t, info.Data, "os")
+	assert.Contains(t, info.Data, "strings")
+}
+
+func TestCacheManager_ReadNonExistent(t *testing.T) {
+	tmpDir := t.TempDir()
+	cm := &CacheManager{
+		cacheDir: tmpDir,
+		version:  "go1.99.0", // Non-existent version
+	}
+
+	info, err := cm.read()
+	assert.Error(t, err)
+	assert.Nil(t, info)
+}
+
+func TestCacheManager_VersionIndependent(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create cache manager for go1.21.0
+	cm1 := &CacheManager{
+		cacheDir: tmpDir,
+		version:  "go1.21.0",
+	}
+	packages1 := map[string]struct{}{"fmt": {}}
+	err := cm1.write(packages1)
+	assert.NoError(t, err)
+
+	// Create cache manager for go1.22.0
+	cm2 := &CacheManager{
+		cacheDir: tmpDir,
+		version:  "go1.22.0",
+	}
+	packages2 := map[string]struct{}{"os": {}, "io": {}}
+	err = cm2.write(packages2)
+	assert.NoError(t, err)
+
+	// Both cache files should exist
+	assert.FileExists(t, cm1.getCacheFile())
+	assert.FileExists(t, cm2.getCacheFile())
+
+	// Read both and verify they are independent
+	info1, err := cm1.read()
+	assert.NoError(t, err)
+	assert.Contains(t, info1.Data, "fmt")
+	assert.NotContains(t, info1.Data, "os")
+
+	info2, err := cm2.read()
+	assert.NoError(t, err)
+	assert.Contains(t, info2.Data, "os")
+	assert.Contains(t, info2.Data, "io")
+	assert.NotContains(t, info2.Data, "fmt")
+}
+
+func TestCacheManager_GetOldCachePath(t *testing.T) {
+	cm, err := newCacheManager()
+	assert.NoError(t, err)
+
+	oldPath := cm.getOldCachePath()
+	assert.Contains(t, oldPath, ".cache/sortimport.json")
+}
+
+func TestCurrentGoVersionCache(t *testing.T) {
+	cm, err := newCacheManager()
+	assert.NoError(t, err)
+
+	// The cache file should include the current Go version
+	expectedVersion := runtime.Version()
+	assert.Equal(t, expectedVersion, cm.version)
+
+	cacheFile := cm.getCacheFile()
+	assert.Contains(t, cacheFile, expectedVersion)
 }
