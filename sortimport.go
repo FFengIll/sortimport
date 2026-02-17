@@ -224,7 +224,7 @@ func processFile(filename string, in io.Reader, out io.Writer) ([]byte, error) {
 		return nil, err
 	}
 
-	res, err := process(src)
+	res, err := process(src, filename)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +259,8 @@ func closeFile(file *os.File) {
 }
 
 // process processes the source of a file, categorising the imports
-func process(src []byte) (output []byte, err error) {
+// filePath is used to detect the local module path for the file
+func process(src []byte, filePath string) (output []byte, err error) {
 	var (
 		fileSet          = token.NewFileSet()
 		convertedImports *impManager
@@ -270,7 +271,15 @@ func process(src []byte) (output []byte, err error) {
 	if err != nil {
 		panic(err)
 	}
-	convertedImports, err = convertImportsToSlice(node)
+
+	// Determine local prefix for this file
+	fileLocalPrefix := *localPrefix
+	if fileLocalPrefix == "" && filePath != "" {
+		// Auto-detect module path from file location
+		fileLocalPrefix = findModulePath(filePath)
+	}
+
+	convertedImports, err = convertImportsToSlice(node, fileLocalPrefix)
 	if err != nil {
 		panic(err)
 	}
@@ -371,7 +380,8 @@ func (m *impManager) countImports() int {
 }
 
 // convertImportsToSlice parses the file with AST and gets all imports
-func convertImportsToSlice(node *dst.File) (*impManager, error) {
+// localPrefix is the module prefix to identify local packages
+func convertImportsToSlice(node *dst.File, localPrefix string) (*impManager, error) {
 	importCategories := newImpManager()
 
 	for _, importSpec := range node.Imports {
@@ -385,7 +395,7 @@ func convertImportsToSlice(node *dst.File) (*impManager, error) {
 		}
 		locImpModel.path = impName
 
-		if *localPrefix != "" && isLocalPackage(impName) {
+		if localPrefix != "" && isLocalPackageWithPrefix(impName, localPrefix) {
 			var group = importCategories.Local()
 			group.append(&locImpModel)
 		} else if isStandardPackage(impNameWithoutQuotes) {
@@ -416,6 +426,18 @@ func isSecondPackage(impName string) bool {
 func isLocalPackage(impName string) bool {
 	// name with " or not
 	if strings.HasPrefix(impName, *localPrefix) || strings.HasPrefix(impName, "\""+*localPrefix) {
+		return true
+	}
+	return false
+}
+
+// isLocalPackageWithPrefix checks if the import is a local package using the given prefix
+func isLocalPackageWithPrefix(impName string, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	// name with " or not
+	if strings.HasPrefix(impName, prefix) || strings.HasPrefix(impName, "\""+prefix) {
 		return true
 	}
 	return false
@@ -610,4 +632,48 @@ func getModuleName() string {
 	modName := modfile.ModulePath(goModBytes)
 
 	return modName
+}
+
+// findModulePath searches for go.mod starting from the given path,
+// traversing up the directory tree until found or reaching the root.
+// Returns the module path from go.mod, or empty string if not found.
+func findModulePath(startPath string) string {
+	// Get absolute path
+	absPath, err := filepath.Abs(startPath)
+	if err != nil {
+		log.Println("error when getting absolute path: ", err)
+		return ""
+	}
+
+	// If it's a file, start from its directory
+	info, err := os.Stat(absPath)
+	if err == nil && !info.IsDir() {
+		absPath = filepath.Dir(absPath)
+	}
+
+	// Traverse up the directory tree
+	currentPath := absPath
+	for {
+		goModPath := filepath.Join(currentPath, "go.mod")
+		if _, err := os.Stat(goModPath); err == nil {
+			// Found go.mod, parse it
+			goModBytes, err := os.ReadFile(goModPath)
+			if err != nil {
+				log.Println("error when reading mod file: ", err)
+				return ""
+			}
+			modName := modfile.ModulePath(goModBytes)
+			log.Printf("found module %s from %s\n", modName, goModPath)
+			return modName
+		}
+
+		// Move up one directory
+		parentPath := filepath.Dir(currentPath)
+		if parentPath == currentPath {
+			// Reached root, no go.mod found
+			log.Println("no go.mod found in directory tree")
+			return ""
+		}
+		currentPath = parentPath
+	}
 }
