@@ -256,8 +256,8 @@ func TestCacheManager_WriteAndRead(t *testing.T) {
 
 	// Test data
 	testPackages := map[string]struct{}{
-		"fmt":   {},
-		"os":    {},
+		"fmt":     {},
+		"os":      {},
 		"strings": {},
 	}
 
