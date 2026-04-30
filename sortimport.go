@@ -168,9 +168,12 @@ func goImportsSortMain() error {
 // processPaths processes each path (file or directory) sequentially.
 // It continues on error so a single bad file does not abort the batch,
 // returning the first error encountered (if any).
+// Go-style "..." patterns are accepted: "./...", "pkg/...", "..." are
+// expanded to their containing directory and walked recursively.
 func processPaths(paths []string, out io.Writer) error {
 	var firstErr error
 	for _, path := range paths {
+		path = stripGoEllipsis(path)
 		dir, statErr := os.Stat(path)
 		if statErr != nil {
 			if firstErr == nil {
@@ -199,6 +202,42 @@ var parseFlags = func() []string {
 	flag.Parse()
 
 	return flag.Args()
+}
+
+// stripGoEllipsis converts Go-style "..." path patterns to their containing
+// directory so that the existing recursive walker handles them. Mirrors the
+// `cmd/go` convention familiar to Go users:
+//
+//	"./..."        -> "./"
+//	"./pkg/..."    -> "./pkg"
+//	"pkg/..."      -> "pkg"
+//	"..."          -> "."
+//	"/abs/p/..."   -> "/abs/p"
+//
+// Paths without a trailing "..." segment are returned unchanged.
+func stripGoEllipsis(path string) string {
+	if path == "..." {
+		return "."
+	}
+	const slashEllipsis = "/..."
+	if strings.HasSuffix(path, slashEllipsis) {
+		stripped := strings.TrimSuffix(path, slashEllipsis)
+		if stripped == "" {
+			return "/"
+		}
+		return stripped
+	}
+	if filepath.Separator != '/' {
+		sepEllipsis := string(filepath.Separator) + "..."
+		if strings.HasSuffix(path, sepEllipsis) {
+			stripped := strings.TrimSuffix(path, sepEllipsis)
+			if stripped == "" {
+				return string(filepath.Separator)
+			}
+			return stripped
+		}
+	}
+	return path
 }
 
 // isGoFile checks if the file is a go file & not a directory
