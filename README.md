@@ -1,4 +1,5 @@
-# go-imports-sort
+# sortimport
+
 This tool aims to automatically fix the order of golang imports. 
 
 This repo is a fork of original [goimportssort](https://github.com/AanZee/goimportssort) with perf and more features.
