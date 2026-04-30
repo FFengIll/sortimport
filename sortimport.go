@@ -158,24 +158,38 @@ func goImportsSortMain() error {
 	}
 
 	// load it in global
-	err = loadStandardPackages()
-	if err != nil {
-		panic(err)
+	if err := loadStandardPackages(); err != nil {
+		return fmt.Errorf("failed to load standard packages: %w", err)
 	}
 
+	return processPaths(paths, os.Stdout)
+}
+
+// processPaths processes each path (file or directory) sequentially.
+// It continues on error so a single bad file does not abort the batch,
+// returning the first error encountered (if any).
+func processPaths(paths []string, out io.Writer) error {
+	var firstErr error
 	for _, path := range paths {
-		switch dir, statErr := os.Stat(path); {
-		case statErr != nil:
-			return statErr
-		case dir.IsDir():
-			return walkDir(path)
-		default:
-			_, err := processFile(path, nil, os.Stdout)
-			return err
+		dir, statErr := os.Stat(path)
+		if statErr != nil {
+			if firstErr == nil {
+				firstErr = statErr
+			}
+			log.Printf("error stating %s: %v\n", path, statErr)
+			continue
+		}
+		if dir.IsDir() {
+			if err := walkDir(path); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if _, err := processFile(path, nil, out); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-
-	return nil
+	return firstErr
 }
 
 // parseFlags parses command line flags and returns the paths to process.
@@ -235,8 +249,13 @@ func processFile(filename string, in io.Reader, out io.Writer) ([]byte, error) {
 			_, _ = fmt.Fprintln(out, string(res))
 		}
 		if *write {
-			err = os.WriteFile(filename, res, 0)
-			if err != nil {
+			mode := os.FileMode(0644)
+			if filename != "" {
+				if info, statErr := os.Stat(filename); statErr == nil {
+					mode = info.Mode().Perm()
+				}
+			}
+			if err := os.WriteFile(filename, res, mode); err != nil {
 				return nil, err
 			}
 		}
@@ -247,7 +266,7 @@ func processFile(filename string, in io.Reader, out io.Writer) ([]byte, error) {
 		log.Println("file has not been changed")
 	}
 
-	return res, err
+	return res, nil
 }
 
 // closeFile tries to close a File and prints an error when it can't
@@ -269,7 +288,7 @@ func process(src []byte, filePath string) (output []byte, err error) {
 
 	node, err = decorator.ParseFile(fileSet, "", src, parser.ParseComments)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	// Determine local prefix for this file
@@ -281,20 +300,20 @@ func process(src []byte, filePath string) (output []byte, err error) {
 
 	convertedImports, err = convertImportsToSlice(node, fileLocalPrefix)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	if convertedImports.countImports() == 0 {
-		return src, err
+		return src, nil
 	}
 
 	convertedImports.sortImports()
 	convertedToGo := convertedImports.convertImportsToGo()
 	output, err = replaceImports(convertedToGo, node)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
-	return output, err
+	return output, nil
 }
 
 // replaceImports replaces existing imports and handles multiple import statements
@@ -316,16 +335,14 @@ func replaceImports(newImports []byte, node *dst.File) ([]byte, error) {
 		return true
 	}, nil)
 
-	err = decorator.Fprint(&buf, node)
-
-	if err == nil {
-		packageName := node.Name.Name
-		output = bytes.Replace(buf.Bytes(), []byte("package "+packageName), append([]byte("package "+packageName+"\n\n"), newImports...), 1)
-	} else {
-		log.Println(err)
+	if err = decorator.Fprint(&buf, node); err != nil {
+		return nil, err
 	}
 
-	return output, err
+	packageName := node.Name.Name
+	output = bytes.Replace(buf.Bytes(), []byte("package "+packageName), append([]byte("package "+packageName+"\n\n"), newImports...), 1)
+
+	return output, nil
 }
 
 func (m *impManager) sortImports() {
@@ -336,15 +353,13 @@ func (m *impManager) sortImports() {
 
 // sortImports sorts multiple imports by import name & prefix
 func (g *impGroup) sortImports() {
-	var imports = g.models
-	for x := 0; x < len(imports); x++ {
-		sort.Slice(imports, func(i, j int) bool {
-			if imports[i].path != imports[j].path {
-				return imports[i].path < imports[j].path
-			}
-			return imports[i].localReference < imports[j].localReference
-		})
-	}
+	imports := g.models
+	sort.Slice(imports, func(i, j int) bool {
+		if imports[i].path != imports[j].path {
+			return imports[i].path < imports[j].path
+		}
+		return imports[i].localReference < imports[j].localReference
+	})
 }
 
 // convertImportsToGo generates output for correct categorised import statements
@@ -423,14 +438,6 @@ func isSecondPackage(impName string) bool {
 	return false
 }
 
-func isLocalPackage(impName string) bool {
-	// name with " or not
-	if strings.HasPrefix(impName, *localPrefix) || strings.HasPrefix(impName, "\""+*localPrefix) {
-		return true
-	}
-	return false
-}
-
 // isLocalPackageWithPrefix checks if the import is a local package using the given prefix
 func isLocalPackageWithPrefix(impName string, prefix string) bool {
 	if prefix == "" {
@@ -474,12 +481,6 @@ func (c *CacheManager) getCacheFile() string {
 	// Sanitize version for filename (replace spaces and special chars)
 	safeVersion := strings.ReplaceAll(c.version, " ", "_")
 	return filepath.Join(c.cacheDir, safeVersion+".json")
-}
-
-// getOldCachePath returns the old single-file cache path for migration
-func (c *CacheManager) getOldCachePath() string {
-	homedir, _ := os.UserHomeDir()
-	return filepath.Join(homedir, ".cache", "sortimport.json")
 }
 
 // read loads the cache for the current Go version

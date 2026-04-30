@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/dave/dst/decorator"
 )
 
 func TestMain(m *testing.M) {
@@ -413,18 +418,6 @@ func TestCacheManager_VersionIndependent(t *testing.T) {
 	}
 }
 
-func TestCacheManager_GetOldCachePath(t *testing.T) {
-	cm, err := newCacheManager()
-	if err != nil {
-		t.Errorf("expected no error, got: %v", err)
-	}
-
-	oldPath := cm.getOldCachePath()
-	if !strings.Contains(oldPath, ".cache/sortimport.json") {
-		t.Errorf("expected oldPath to contain .cache/sortimport.json, got: %s", oldPath)
-	}
-}
-
 func TestCurrentGoVersionCache(t *testing.T) {
 	cm, err := newCacheManager()
 	if err != nil {
@@ -549,5 +542,571 @@ func TestIsLocalPackageWithPrefix(t *testing.T) {
 				t.Errorf("expected %v, got %v", tt.expected, result)
 			}
 		})
+	}
+}
+
+// resetFlag restores the value pointed to by *string flag pointers after a test.
+func resetStringFlag(t *testing.T, ptr *string) {
+	t.Helper()
+	prev := *ptr
+	t.Cleanup(func() { *ptr = prev })
+}
+
+func resetBoolFlag(t *testing.T, ptr *bool) {
+	t.Helper()
+	prev := *ptr
+	t.Cleanup(func() { *ptr = prev })
+}
+
+func TestProcessFile_SecondPart(t *testing.T) {
+	resetStringFlag(t, localPrefix)
+	resetStringFlag(t, secondPrefix)
+	*localPrefix = "github.com/myorg/myrepo"
+	*secondPrefix = "github.com/myorg"
+
+	reader := strings.NewReader(`package main
+
+import (
+	"fmt"
+	"github.com/external/lib"
+	"github.com/myorg/shared"
+	"github.com/myorg/myrepo/pkg"
+	"os"
+)
+
+func main() {}
+`)
+	want := `package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/external/lib"
+
+	"github.com/myorg/shared"
+
+	"github.com/myorg/myrepo/pkg"
+)
+
+func main() {}
+`
+
+	output, err := processFile("", reader, os.Stdout)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if string(output) != want {
+		t.Errorf("expected:\n%s\ngot:\n%s", want, string(output))
+	}
+}
+
+func TestProcessFile_BlankAndDotImport(t *testing.T) {
+	resetStringFlag(t, localPrefix)
+	resetStringFlag(t, secondPrefix)
+	*localPrefix = "github.com/myorg/myrepo"
+
+	reader := strings.NewReader(`package main
+
+import (
+	_ "embed"
+	. "fmt"
+	mylog "log"
+	"os"
+)
+
+func main() {}
+`)
+
+	output, err := processFile("", reader, os.Stdout)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	got := string(output)
+	for _, snippet := range []string{
+		`_ "embed"`,
+		`. "fmt"`,
+		`mylog "log"`,
+		`"os"`,
+	} {
+		if !strings.Contains(got, snippet) {
+			t.Errorf("expected output to contain %q, got:\n%s", snippet, got)
+		}
+	}
+}
+
+func TestProcessFile_InvalidSource(t *testing.T) {
+	resetStringFlag(t, localPrefix)
+	*localPrefix = "github.com/myorg/myrepo"
+
+	// Missing closing brace makes this unparseable.
+	reader := strings.NewReader(`package main
+import "fmt"
+func main() { fmt.Println("Hello"
+`)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("processFile should not panic on invalid source, got: %v", r)
+		}
+	}()
+
+	_, err := processFile("", reader, os.Stdout)
+	if err == nil {
+		t.Fatal("expected error on invalid source, got nil")
+	}
+}
+
+func TestProcessFile_ListMode(t *testing.T) {
+	resetStringFlag(t, localPrefix)
+	resetBoolFlag(t, list)
+	*localPrefix = "github.com/myorg/myrepo"
+	*list = true
+
+	src := `package main
+
+import (
+	"os"
+	"fmt"
+)
+
+func main() {}
+`
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "in.go")
+	if err := os.WriteFile(fp, []byte(src), 0644); err != nil {
+		t.Fatalf("write tmp file: %v", err)
+	}
+
+	var out bytes.Buffer
+	res, err := processFile(fp, nil, &out)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if !strings.Contains(out.String(), "\"fmt\"") || !strings.Contains(out.String(), "\"os\"") {
+		t.Errorf("expected list output to contain imports, got: %q", out.String())
+	}
+	if res == nil {
+		t.Error("expected non-nil result")
+	}
+	// File on disk must NOT be modified in list mode.
+	disk, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("read tmp file: %v", err)
+	}
+	if string(disk) != src {
+		t.Errorf("file on disk should not change in list mode\nexpected:\n%s\ngot:\n%s", src, string(disk))
+	}
+}
+
+func TestProcessFile_WriteMode(t *testing.T) {
+	resetStringFlag(t, localPrefix)
+	resetBoolFlag(t, write)
+	*localPrefix = "github.com/myorg/myrepo"
+	*write = true
+
+	src := `package main
+
+import (
+	"os"
+	"fmt"
+)
+
+func main() {}
+`
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "in.go")
+	if err := os.WriteFile(fp, []byte(src), 0644); err != nil {
+		t.Fatalf("write tmp file: %v", err)
+	}
+
+	if _, err := processFile(fp, nil, os.Stdout); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	disk, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("read tmp file: %v", err)
+	}
+	got := string(disk)
+	// "fmt" should now precede "os" alphabetically inside the import block.
+	fmtIdx := strings.Index(got, "\"fmt\"")
+	osIdx := strings.Index(got, "\"os\"")
+	if fmtIdx < 0 || osIdx < 0 || fmtIdx > osIdx {
+		t.Errorf("write mode should sort imports on disk, got:\n%s", got)
+	}
+}
+
+func TestProcessFile_PreservesFileMode(t *testing.T) {
+	resetStringFlag(t, localPrefix)
+	resetBoolFlag(t, write)
+	*localPrefix = "github.com/myorg/myrepo"
+	*write = true
+
+	src := `package main
+
+import (
+	"os"
+	"fmt"
+)
+
+func main() {}
+`
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "in.go")
+	if err := os.WriteFile(fp, []byte(src), 0600); err != nil {
+		t.Fatalf("write tmp file: %v", err)
+	}
+	// Re-chmod to be sure (umask might have stripped perms on creation).
+	if err := os.Chmod(fp, 0600); err != nil {
+		t.Fatalf("chmod tmp file: %v", err)
+	}
+
+	if _, err := processFile(fp, nil, os.Stdout); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	info, err := os.Stat(fp)
+	if err != nil {
+		t.Fatalf("stat tmp file: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Errorf("expected mode 0600 preserved, got %o", got)
+	}
+}
+
+func TestWalkDir(t *testing.T) {
+	resetStringFlag(t, localPrefix)
+	resetBoolFlag(t, list)
+	*localPrefix = "github.com/myorg/myrepo"
+	// Avoid stdout noise but still exercise the processing branch.
+	*list = false
+
+	root := t.TempDir()
+	files := map[string]string{
+		"a.go":          "package a\nimport (\n\t\"os\"\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprintf\nvar _ = os.Args\n",
+		"b.txt":         "not a go file",
+		".hidden.go":    "package hidden\n",
+		"sub/c.go":      "package c\nimport (\n\t\"os\"\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprintf\nvar _ = os.Args\n",
+		"sub/d.notgo":   "skip me",
+		"sub/.dotted.go": "package dotted\n",
+	}
+	for rel, content := range files {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+
+	if err := walkDir(root); err != nil {
+		t.Fatalf("walkDir error: %v", err)
+	}
+	// We can't easily assert which files were processed without instrumenting,
+	// but reaching this point with no error proves the walker handled the mix.
+}
+
+func TestProcessPaths_MultiplePaths(t *testing.T) {
+	// Verifies the multi-path fix: every path in the slice gets processed,
+	// not just the first one.
+	resetStringFlag(t, localPrefix)
+	resetBoolFlag(t, write)
+	*localPrefix = "github.com/myorg/myrepo"
+	*write = true
+
+	src := `package main
+
+import (
+	"os"
+	"fmt"
+)
+
+func main() {}
+`
+	dir := t.TempDir()
+	paths := []string{
+		filepath.Join(dir, "a.go"),
+		filepath.Join(dir, "b.go"),
+		filepath.Join(dir, "c.go"),
+	}
+	for _, p := range paths {
+		if err := os.WriteFile(p, []byte(src), 0644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	if err := processPaths(paths, os.Stdout); err != nil {
+		t.Fatalf("processPaths: %v", err)
+	}
+
+	// Every file must be sorted (fmt before os in the import block).
+	for _, p := range paths {
+		disk, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read %s: %v", p, err)
+		}
+		fmtIdx := strings.Index(string(disk), "\"fmt\"")
+		osIdx := strings.Index(string(disk), "\"os\"")
+		if fmtIdx < 0 || osIdx < 0 || fmtIdx > osIdx {
+			t.Errorf("file %s not sorted, content:\n%s", p, string(disk))
+		}
+	}
+}
+
+func TestProcessPaths_DirAndFile(t *testing.T) {
+	// Mix a directory and a file; both must be processed.
+	resetStringFlag(t, localPrefix)
+	resetBoolFlag(t, write)
+	*localPrefix = "github.com/myorg/myrepo"
+	*write = true
+
+	src := `package main
+
+import (
+	"os"
+	"fmt"
+)
+
+func main() {}
+`
+	root := t.TempDir()
+	subDir := filepath.Join(root, "pkg")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	dirFile := filepath.Join(subDir, "in.go")
+	loneFile := filepath.Join(root, "lone.go")
+	for _, p := range []string{dirFile, loneFile} {
+		if err := os.WriteFile(p, []byte(src), 0644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	if err := processPaths([]string{subDir, loneFile}, os.Stdout); err != nil {
+		t.Fatalf("processPaths: %v", err)
+	}
+
+	for _, p := range []string{dirFile, loneFile} {
+		disk, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read %s: %v", p, err)
+		}
+		if strings.Index(string(disk), "\"fmt\"") > strings.Index(string(disk), "\"os\"") {
+			t.Errorf("file %s not sorted, content:\n%s", p, string(disk))
+		}
+	}
+}
+
+func TestProcessPaths_StatErrorContinues(t *testing.T) {
+	// A nonexistent path must not stop processing of subsequent valid paths.
+	resetStringFlag(t, localPrefix)
+	resetBoolFlag(t, write)
+	*localPrefix = "github.com/myorg/myrepo"
+	*write = true
+
+	src := `package main
+
+import (
+	"os"
+	"fmt"
+)
+
+func main() {}
+`
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.go")
+	if err := os.WriteFile(good, []byte(src), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	bad := filepath.Join(dir, "doesnotexist.go")
+
+	err := processPaths([]string{bad, good}, os.Stdout)
+	if err == nil {
+		t.Error("expected non-nil error for missing path")
+	}
+
+	// good.go must still have been processed despite the bad path.
+	disk, _ := os.ReadFile(good)
+	if strings.Index(string(disk), "\"fmt\"") > strings.Index(string(disk), "\"os\"") {
+		t.Errorf("good file not sorted after stat error on earlier path:\n%s", string(disk))
+	}
+}
+
+func TestConvertImportsToSlice(t *testing.T) {
+	resetStringFlag(t, secondPrefix)
+	*secondPrefix = "github.com/myorg"
+
+	src := `package main
+
+import (
+	"fmt"
+	_ "embed"
+	"github.com/external/lib"
+	"github.com/myorg/shared"
+	"github.com/myorg/myrepo/internal/foo"
+	alias "github.com/myorg/myrepo/internal/bar"
+)
+`
+	fset := token.NewFileSet()
+	node, err := decorator.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	mgr, err := convertImportsToSlice(node, "github.com/myorg/myrepo")
+	if err != nil {
+		t.Fatalf("convertImportsToSlice: %v", err)
+	}
+
+	if got := mgr.Standard().countImports(); got != 2 {
+		t.Errorf("standard count = %d, want 2", got)
+	}
+	if got := mgr.ThirdPart().countImports(); got != 1 {
+		t.Errorf("third count = %d, want 1", got)
+	}
+	if got := mgr.SecondPart().countImports(); got != 1 {
+		t.Errorf("second count = %d, want 1", got)
+	}
+	if got := mgr.Local().countImports(); got != 2 {
+		t.Errorf("local count = %d, want 2", got)
+	}
+	if got := mgr.countImports(); got != 6 {
+		t.Errorf("total = %d, want 6", got)
+	}
+
+	// Ensure the aliased local import preserved its qualifier.
+	var foundAlias bool
+	for _, m := range mgr.Local().models {
+		if m.localReference == "alias" {
+			foundAlias = true
+			break
+		}
+	}
+	if !foundAlias {
+		t.Error("expected aliased local import to keep its qualifier")
+	}
+}
+
+func TestIsStandardPackage(t *testing.T) {
+	if !isStandardPackage("fmt") {
+		t.Error("fmt should be standard")
+	}
+	if !isStandardPackage("os") {
+		t.Error("os should be standard")
+	}
+	if isStandardPackage("github.com/external/lib") {
+		t.Error("third-party package should not be standard")
+	}
+	if isStandardPackage("") {
+		t.Error("empty string should not be standard")
+	}
+}
+
+func TestCacheManager_Update(t *testing.T) {
+	tmp := t.TempDir()
+	cm := &CacheManager{cacheDir: tmp, version: runtime.Version()}
+
+	if err := cm.update(); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	cacheFile := cm.getCacheFile()
+	if _, err := os.Stat(cacheFile); err != nil {
+		t.Fatalf("expected cache file to exist: %v", err)
+	}
+
+	info, err := cm.read()
+	if err != nil {
+		t.Fatalf("read after update: %v", err)
+	}
+	if info.Version != runtime.Version() {
+		t.Errorf("version = %q, want %q", info.Version, runtime.Version())
+	}
+	if _, ok := info.Data["fmt"]; !ok {
+		t.Error("expected fmt in updated cache data")
+	}
+}
+
+func TestCacheManager_LoadOrFetch_Hit(t *testing.T) {
+	tmp := t.TempDir()
+	cm := &CacheManager{cacheDir: tmp, version: "go-test-fake"}
+
+	seed := map[string]struct{}{"my/fake/pkg": {}}
+	if err := cm.write(seed); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	got, err := cm.loadOrFetch()
+	if err != nil {
+		t.Fatalf("loadOrFetch: %v", err)
+	}
+	if _, ok := got["my/fake/pkg"]; !ok {
+		t.Error("expected seeded data to be returned (cache hit)")
+	}
+	// Real std package must NOT be in the seeded result.
+	if _, ok := got["fmt"]; ok {
+		t.Error("did not expect fmt in seeded cache hit result")
+	}
+}
+
+func TestCacheManager_LoadOrFetch_Miss(t *testing.T) {
+	tmp := t.TempDir()
+	cm := &CacheManager{cacheDir: tmp, version: runtime.Version()}
+
+	got, err := cm.loadOrFetch()
+	if err != nil {
+		t.Fatalf("loadOrFetch: %v", err)
+	}
+	if _, ok := got["fmt"]; !ok {
+		t.Error("expected fetched std packages to include fmt")
+	}
+	// After miss, cache file should now exist for next call.
+	if _, err := os.Stat(cm.getCacheFile()); err != nil {
+		t.Errorf("expected cache file after miss: %v", err)
+	}
+}
+
+func TestSortImports_Stable(t *testing.T) {
+	g := &impGroup{models: []*impModel{
+		{path: `"github.com/b/x"`},
+		{path: `"github.com/a/y"`},
+		{path: `"github.com/a/y"`, localReference: "alias"},
+		{path: `"github.com/a/x"`},
+	}}
+	g.sortImports()
+
+	wantPaths := []string{
+		`"github.com/a/x"`,
+		`"github.com/a/y"`,
+		`"github.com/a/y"`,
+		`"github.com/b/x"`,
+	}
+	wantRefs := []string{"", "", "alias", ""}
+	for i, m := range g.models {
+		if m.path != wantPaths[i] || m.localReference != wantRefs[i] {
+			t.Errorf("models[%d] = (%q, %q), want (%q, %q)",
+				i, m.path, m.localReference, wantPaths[i], wantRefs[i])
+		}
+	}
+}
+
+func TestConvertImportsToGo_GroupSeparator(t *testing.T) {
+	mgr := newImpManager()
+	mgr.Standard().append(&impModel{path: `"fmt"`})
+	mgr.ThirdPart().append(&impModel{path: `"github.com/x/y"`})
+	mgr.Local().append(&impModel{path: `"github.com/myorg/myrepo/pkg"`})
+
+	out := string(mgr.convertImportsToGo())
+	if !strings.HasPrefix(out, "import (") {
+		t.Errorf("expected import block, got: %q", out)
+	}
+	if !strings.HasSuffix(out, ")") {
+		t.Errorf("expected closing paren, got: %q", out)
+	}
+	// Group separator: a blank line between non-empty groups.
+	// We expect 2 separators (between std/third and third/local).
+	if got := strings.Count(out, "\n\n\t"); got != 2 {
+		t.Errorf("expected 2 blank-line group separators, got %d in:\n%s", got, out)
 	}
 }
