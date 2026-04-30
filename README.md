@@ -21,3 +21,4 @@ go install github.com/FFengIll/sortimport@latest
 - Support secondary package prefix (2-part-package) which will sort import into 4 groups.
 - Cache standard package info to reduce parse time cost and run more quickly.
 - Auto-detect local module path from file location (traverse up directory tree to find go.mod).
+- Accept Go-style `./...` path patterns (e.g. `sortimport -w ./...` or `sortimport -w ./pkg/...`) — same recursion semantics as `cmd/go`.
